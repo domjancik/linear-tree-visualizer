@@ -89,6 +89,59 @@ function Sidebar({ workspace, viewer, activeView, onNavigate, onForgetToken }) {
   </aside>
 }
 
+function fuzzyScore(label, query) {
+  const haystack = label.toLocaleLowerCase()
+  const needle = query.trim().toLocaleLowerCase()
+  if (!needle) return 0
+  const contiguous = haystack.indexOf(needle)
+  if (contiguous >= 0) return contiguous + (haystack === needle ? -100 : 0)
+  let cursor = -1
+  let score = 0
+  for (const character of needle) {
+    const next = haystack.indexOf(character, cursor + 1)
+    if (next < 0) return null
+    score += (next - cursor - 1) * 4
+    cursor = next
+  }
+  return score + haystack.length * .01
+}
+
+function FuzzyInitiativeFilter({ icon: Icon, value, options, allLabel, searchLabel, onChange, title }) {
+  const [open, setOpen] = useState(false)
+  const [query, setQuery] = useState('')
+  const ref = useRef(null)
+  const selected = options.find(option => option.value === value)
+  const matches = options
+    .map(option => ({ option, score: fuzzyScore(option.searchText || option.label, query) }))
+    .filter(item => item.score !== null)
+    .sort((a, b) => a.score - b.score || a.option.label.localeCompare(b.option.label))
+
+  useEffect(() => {
+    if (!open) return
+    const closeOnOutsideClick = event => { if (!ref.current?.contains(event.target)) setOpen(false) }
+    document.addEventListener('mousedown', closeOnOutsideClick)
+    return () => document.removeEventListener('mousedown', closeOnOutsideClick)
+  }, [open])
+
+  const choose = nextValue => {
+    onChange(nextValue)
+    setOpen(false)
+    setQuery('')
+  }
+
+  return <div className={`initiative-fuzzy-filter ${value !== 'all' ? 'active' : ''}`} ref={ref} title={title}>
+    <button type="button" className="initiative-filter-trigger" onClick={() => setOpen(current => !current)} aria-expanded={open}><Icon size={13} /><span>{selected?.label || allLabel}</span><ChevronDown size={11} /></button>
+    {open && <div className="initiative-filter-menu" onKeyDown={event => { if (event.key === 'Escape') setOpen(false) }}>
+      <div className="initiative-filter-search"><Search size={13} /><input autoFocus value={query} onChange={event => setQuery(event.target.value)} placeholder={searchLabel} aria-label={searchLabel} />{query && <button type="button" onClick={() => setQuery('')}><X size={12} /></button>}</div>
+      <div className="initiative-filter-options">
+        <button type="button" className={value === 'all' ? 'selected' : ''} onClick={() => choose('all')}><span>{allLabel}</span>{value === 'all' && <Check size={12} />}</button>
+        {matches.map(({ option }) => <button type="button" key={option.value} className={value === option.value ? 'selected' : ''} onClick={() => choose(option.value)} title={option.label}><span>{option.label}</span>{value === option.value && <Check size={12} />}</button>)}
+        {!matches.length && <div className="initiative-filter-empty">No matches</div>}
+      </div>
+    </div>}
+  </div>
+}
+
 function InitiativesScreen({ data, selectedIds, onToggle, onViewTree }) {
   const [search, setSearch] = useState('')
   const [health, setHealth] = useState('all')
@@ -99,6 +152,8 @@ function InitiativesScreen({ data, selectedIds, onToggle, onViewTree }) {
     .filter(Boolean)
   const owners = [...new Set(rootInitiatives.map(item => item.owner))].sort((a, b) => a.localeCompare(b))
   const teams = [...new Map(rootInitiatives.flatMap(item => item.teams || []).map(item => [item.id, item])).values()].sort((a, b) => a.name.localeCompare(b.name))
+  const ownerOptions = owners.map(name => ({ value: name, label: name }))
+  const teamOptions = [...teams.map(item => ({ value: item.id, label: item.name, searchText: `${item.name} ${item.key || ''}` })), { value: 'none', label: 'No project team' }]
   const initiatives = rootInitiatives
     .filter(item => !search || `${item.name} ${item.owner} ${(item.teams || []).map(entry => entry.name).join(' ')} ${item.description || ''}`.toLowerCase().includes(search.toLowerCase()))
     .filter(item => health === 'all' || item.health === health)
@@ -111,8 +166,8 @@ function InitiativesScreen({ data, selectedIds, onToggle, onViewTree }) {
     <section className="initiatives-toolbar">
       <div className="search-box initiative-search"><Search size={15} /><input value={search} onChange={event => setSearch(event.target.value)} placeholder="Search initiatives…" />{search && <button onClick={() => setSearch('')}><X size={13} /></button>}</div>
       <div className="health-chips"><button className={health === 'all' ? 'selected' : ''} onClick={() => setHealth('all')}>All</button>{Object.entries(healthMeta).map(([key, meta]) => <button key={key} className={health === key ? 'selected' : ''} onClick={() => setHealth(key)}><i style={{ background: meta.color }} />{meta.label}</button>)}</div>
-      <label className={`initiative-select-filter ${owner !== 'all' ? 'active' : ''}`}><Users size={13} /><select value={owner} onChange={event => setOwner(event.target.value)} aria-label="Filter initiatives by owner"><option value="all">All owners</option>{owners.map(name => <option key={name} value={name}>{name}</option>)}</select><ChevronDown size={11} /></label>
-      <label className={`initiative-select-filter ${team !== 'all' ? 'active' : ''}`} title="Teams are derived from projects across the initiative hierarchy"><Building2 size={13} /><select value={team} onChange={event => setTeam(event.target.value)} aria-label="Filter initiatives by project team"><option value="all">All teams</option>{teams.map(item => <option key={item.id} value={item.id}>{item.name}</option>)}<option value="none">No project team</option></select><ChevronDown size={11} /></label>
+      <FuzzyInitiativeFilter icon={Users} value={owner} options={ownerOptions} allLabel="All owners" searchLabel="Find an owner…" onChange={setOwner} />
+      <FuzzyInitiativeFilter icon={Building2} value={team} options={teamOptions} allLabel="All teams" searchLabel="Find a team…" onChange={setTeam} title="Teams are derived from projects across the initiative hierarchy" />
       <span className="initiative-result-count">{initiatives.length} initiatives</span>
     </section>
     <div className="initiatives-scroll">
