@@ -29,6 +29,7 @@ const PROJECTS_QUERY = `
             assignee { id name displayName }
             state { id name type color }
             team { id name key }
+            cycle { id name number }
           }
           pageInfo { hasNextPage }
         }
@@ -73,6 +74,9 @@ function normalize(viewer, rawInitiatives, rawProjects, truncated) {
         url: issue.url,
         projectId: project.id,
         team: issue.team?.name || issue.team?.key || 'Team',
+        cycleId: issue.cycle?.id || null,
+        cycleName: issue.cycle?.name || (issue.cycle?.number ? `Cycle ${issue.cycle.number}` : 'Unnamed cycle'),
+        cycleNumber: issue.cycle?.number || null,
         owner: issue.assignee?.displayName || issue.assignee?.name || 'Unassigned',
         ownerInitials: initials(issue.assignee),
         state: issue.state?.name || 'No status',
