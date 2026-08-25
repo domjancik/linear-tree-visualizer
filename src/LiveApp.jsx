@@ -312,7 +312,9 @@ export default function LiveApp() {
       return items
     })
     const branchProjectIds = new Set(branches.flatMap(item => item.projectIds))
-    const projects = data.projects.filter(item => branchProjectIds.has(item.id))
+    const issueMatchesCycle = issue => cycleFilter === 'all' || (cycleFilter === 'none' ? !issue.cycleId : issue.cycleId === cycleFilter)
+    const projectsWithMatchingIssues = cycleFilter === 'all' ? null : new Set(data.issues.filter(issueMatchesCycle).map(issue => issue.projectId))
+    const projects = data.projects.filter(item => branchProjectIds.has(item.id) && (!projectsWithMatchingIssues || projectsWithMatchingIssues.has(item.id)))
     const openBranchSources = new Set(branches.filter(item => !collapsedInitiatives.has(item.id)).map(item => item.sourceId))
     const rootRank = new Map(roots.map((root, index) => [root.id, index]))
     const projectRoot = project => branches
@@ -340,7 +342,7 @@ export default function LiveApp() {
     }
     const visibleProjects = allProjects.filter(project => shelfDetailed(projectRoot(project)) && project.initiativeIds.some(id => openBranchSources.has(id)))
     const visibleProjectIds = new Set(visibleProjects.filter(project => !collapsedProjects.has(project.id)).map(project => project.id))
-    const issues = data.issues.filter(item => visibleProjectIds.has(item.projectId) && (cycleFilter === 'all' || (cycleFilter === 'none' ? !item.cycleId : item.cycleId === cycleFilter)))
+    const issues = data.issues.filter(item => visibleProjectIds.has(item.projectId) && issueMatchesCycle(item))
     const projectBase = new Map(), issueBase = new Map(), branchBase = new Map(), rootBase = new Map()
     const shelves = [], rails = [], laneModels = []
     const widestActiveShelf = Math.max(1, ...roots.map(root => columnCountForRoot(root.id)))
@@ -455,7 +457,7 @@ export default function LiveApp() {
     if (collapsedInitiatives.has(branch.id)) return
     const rail = tree.rails.find(item => item.rootId === branch.rootId)
     const shelf = tree.shelves.find(item => item.root.id === branch.rootId)
-    if (!rail && shelf && !shelf.detailed) {
+    if (!rail && shelf && !shelf.detailed && shelf.projects.length) {
       edges.push(makeEdge(tree.branchPos.get(branch.id), tree.shelfPos.get(branch.rootId), 'initiative', 'project', branch.health))
       return
     }
@@ -510,9 +512,9 @@ export default function LiveApp() {
         <div className="canvas" style={{ width: tree.width * zoom, height: tree.height * zoom }}><div className="canvas-scale" style={{ width: tree.width, height: tree.height, transform: `scale(${zoom})` }}>
           {orientation === 'horizontal' ? <><div className="column-label" style={{ left: 34 }}>ROOT INITIATIVES <span>{tree.roots.length}</span></div><div className="column-label" style={{ left: 375 }}>INITIATIVES <span>{tree.branches.length}</span></div><div className="column-label" style={{ left: 740 }}>PROJECT SHELVES <span>{tree.projectCount}</span></div><div className="column-label" style={{ left: tree.issueLayerOffset }}>ISSUES <span>{tree.issues.length}</span></div></> : <><div className="column-label row-label" style={{ top: 13 }}>ROOT INITIATIVES <span>{tree.roots.length}</span></div><div className="column-label row-label" style={{ top: 354 }}>INITIATIVES <span>{tree.branches.length}</span></div><div className="column-label row-label" style={{ top: 719 }}>PROJECT SHELVES <span>{tree.projectCount}</span></div><div className="column-label row-label" style={{ top: tree.issueLayerOffset - 21 }}>ISSUES <span>{tree.issues.length}</span></div></>}
           {tree.lanes.map(lane => <div key={lane.id} className={`initiative-lane lane-${lane.index % 2}`} style={{ left: lane.x, top: lane.y, width: lane.width, height: lane.height }} />)}
-          {tree.shelves.filter(shelf => shelf.detailed && shelf.visible).map(shelf => { const pos = tree.shelfPos.get(shelf.root.id); return <div key={shelf.root.id} className="project-shelf-frame" style={{ left: pos.x - 14, top: pos.y - 16, width: orientation === 'vertical' ? shelf.height + 28 : shelf.width + 28, height: orientation === 'vertical' ? shelf.width + 28 : shelf.height + 28 }}><span>{shelf.projects.length} projects · {shelf.groupingLabel === 'None' ? 'alphabetical' : `grouped by ${shelf.groupingLabel.toLowerCase()}`}</span></div> })}
+          {tree.shelves.filter(shelf => shelf.detailed && shelf.visible && shelf.projects.length).map(shelf => { const pos = tree.shelfPos.get(shelf.root.id); return <div key={shelf.root.id} className="project-shelf-frame" style={{ left: pos.x - 14, top: pos.y - 16, width: orientation === 'vertical' ? shelf.height + 28 : shelf.width + 28, height: orientation === 'vertical' ? shelf.width + 28 : shelf.height + 28 }}><span>{shelf.projects.length} projects · {shelf.groupingLabel === 'None' ? 'alphabetical' : `grouped by ${shelf.groupingLabel.toLowerCase()}`}</span></div> })}
           <svg className="connectors" width={tree.width} height={tree.height}>{tree.rails.filter(rail => rail.visible).map(rail => <path key={`rail:${rail.rootId}`} d={`M ${rail.a.x} ${rail.a.y} L ${rail.b.x} ${rail.b.y}`} className="project-rail" />)}{edges.map((edge, index) => { const path = orientation === 'vertical' ? (() => { const bend = edge.from.y + (edge.to.y - edge.from.y) * .48; return `M ${edge.from.x} ${edge.from.y} C ${edge.from.x} ${bend}, ${edge.to.x} ${bend}, ${edge.to.x} ${edge.to.y}` })() : (() => { const bend = edge.from.x + (edge.to.x - edge.from.x) * .48; return `M ${edge.from.x} ${edge.from.y} C ${bend} ${edge.from.y}, ${bend} ${edge.to.y}, ${edge.to.x} ${edge.to.y}` })(); return <path key={index} d={path} className={edge.shared ? 'shared' : ''} style={{ '--edge': healthMeta[edge.health]?.color }} /> })}</svg>
-          {tree.shelves.filter(shelf => !shelf.detailed && shelf.visible).map(shelf => <ShelfSummary key={shelf.root.id} shelf={shelf} pos={tree.shelfPos.get(shelf.root.id)} orientation={orientation} onExpand={id => setExpandedShelves(previous => new Set(previous).add(id))} />)}
+          {tree.shelves.filter(shelf => !shelf.detailed && shelf.visible && shelf.projects.length).map(shelf => <ShelfSummary key={shelf.root.id} shelf={shelf} pos={tree.shelfPos.get(shelf.root.id)} orientation={orientation} onExpand={id => setExpandedShelves(previous => new Set(previous).add(id))} />)}
           {tree.roots.map(item => <NodeCard key={item.id} kind="root" item={item} pos={tree.rootPos.get(item.id)} orientation={orientation} onSelect={setSelection} selected={selection?.item.id === item.id} dimmed={dimmed(item)} />)}
           {tree.branches.map(item => <NodeCard key={item.id} kind="initiative" item={item} pos={tree.branchPos.get(item.id)} orientation={orientation} collapsed={collapsedInitiatives.has(item.id)} onToggle={id => toggle(setCollapsedInitiatives, id)} onSelect={setSelection} selected={selection?.item.id === item.id} dimmed={dimmed(item)} />)}
           {tree.projects.filter(item => isCardVisible(tree.projectPos.get(item.id), 126)).map(item => <NodeCard key={item.id} kind="project" item={item} pos={tree.projectPos.get(item.id)} orientation={orientation} collapsed={collapsedProjects.has(item.id)} onToggle={id => toggle(setCollapsedProjects, id)} onSelect={setSelection} selected={selection?.item.id === item.id} dimmed={dimmed(item)} />)}
