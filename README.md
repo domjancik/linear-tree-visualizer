@@ -14,6 +14,8 @@ Zoom with the canvas controls or use a trackpad pinch / `Ctrl` or `Cmd` plus mou
 
 Projects are arranged in shelves of up to three columns per initiative. Use the **Group** control to order and label cards by health, project lead, or alphabetically; the choice is stored locally. Below 72% zoom, each shelf becomes an aggregate health summary unless it contains explicitly expanded issues; select the summary to keep its project cards expanded. The issue layer follows the widest active shelf instead of always reserving three columns. Project and issue cards outside the visible canvas window are not mounted, while their layout space and connectors remain stable.
 
+The app first loads lightweight initiative metadata for navigation. It then requests projects only for the selected initiative subtrees and fully paginates issues only for those projects. Changing the initiative selection cancels an obsolete in-flight execution request and loads the new scope.
+
 ## Use the hosted app
 
 Open <https://domjancik.github.io/linear-tree-visualizer/> and paste a personal Linear API key. The key is stored in that browser's `localStorage`, sent directly to `https://api.linear.app`, and never committed to this repository or sent to an application server.
@@ -38,6 +40,6 @@ npm run build
 npm run preview
 ```
 
-Pushes to `main` deploy the `dist` build through GitHub Actions and GitHub Pages. Initiative and project connections are paginated; issues are bounded to 25 per project to remain below Linear's GraphQL query-complexity limit, and the interface calls out truncated results.
+Pushes to `main` deploy the `dist` build through GitHub Actions and GitHub Pages. Initiative, project, and selected-project issue connections are fully paginated. Large GraphQL filters are chunked to keep each request bounded.
 
 No Linear token is needed at build time and no token belongs in GitHub Actions secrets.

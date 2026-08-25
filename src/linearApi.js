@@ -7,6 +7,7 @@ const INITIATIVES_QUERY = `
       nodes {
         id name description url color health status targetDate updatedAt
         owner { id name displayName }
+        leadTeam { id name key }
         parentInitiative { id }
       }
       pageInfo { hasNextPage endCursor }
@@ -15,24 +16,40 @@ const INITIATIVES_QUERY = `
 `
 
 const PROJECTS_QUERY = `
-  query GoalTreeProjects($after: String) {
-    projects(first: 25, after: $after, orderBy: updatedAt) {
+  query GoalTreeProjects($after: String, $initiativeIds: [ID!]!) {
+    projects(
+      first: 50
+      after: $after
+      orderBy: updatedAt
+      filter: { initiatives: { some: { id: { in: $initiativeIds } } } }
+    ) {
       nodes {
         id name description url color health progress updatedAt
         completedIssueCountHistory issueCountHistory
         lead { id name displayName }
         initiatives(first: 50) { nodes { id } }
         teams(first: 50) { nodes { id name key } }
-        issues(first: 25, orderBy: updatedAt) {
-          nodes {
-            id identifier title url priorityLabel updatedAt completedAt canceledAt
-            assignee { id name displayName }
-            state { id name type color }
-            team { id name key }
-            cycle { id name number }
-          }
-          pageInfo { hasNextPage }
-        }
+      }
+      pageInfo { hasNextPage endCursor }
+    }
+  }
+`
+
+const ISSUES_QUERY = `
+  query GoalTreeIssues($after: String, $projectIds: [ID!]!) {
+    issues(
+      first: 100
+      after: $after
+      orderBy: updatedAt
+      filter: { project: { id: { in: $projectIds } } }
+    ) {
+      nodes {
+        id identifier title url priorityLabel updatedAt completedAt canceledAt
+        project { id }
+        assignee { id name displayName }
+        state { id name type color }
+        team { id name key }
+        cycle { id name number }
       }
       pageInfo { hasNextPage endCursor }
     }
@@ -57,65 +74,15 @@ function initials(user) {
   return name.split(/\s+/).slice(0, 2).map(part => part[0]).join('').toUpperCase()
 }
 
-function normalize(viewer, rawInitiatives, rawProjects, truncated) {
-  const projectMap = new Map()
-  const issueMap = new Map()
+function chunks(items, size = 100) {
+  const result = []
+  for (let index = 0; index < items.length; index += size) result.push(items.slice(index, index + size))
+  return result
+}
 
-  for (const project of rawProjects) {
-    const initiativeIds = new Set(project.initiatives.nodes.map(item => item.id))
-    const teams = project.teams.nodes.map(team => ({ id: team.id, name: team.name, key: team.key }))
-    const issueIds = []
-    for (const issue of project.issues.nodes) {
-      issueIds.push(issue.id)
-      issueMap.set(issue.id, {
-        id: issue.id,
-        identifier: issue.identifier,
-        title: issue.title,
-        url: issue.url,
-        projectId: project.id,
-        team: issue.team?.name || issue.team?.key || 'Team',
-        cycleId: issue.cycle?.id || null,
-        cycleName: issue.cycle?.name || (issue.cycle?.number ? `Cycle ${issue.cycle.number}` : 'Unnamed cycle'),
-        cycleNumber: issue.cycle?.number || null,
-        owner: issue.assignee?.displayName || issue.assignee?.name || 'Unassigned',
-        ownerInitials: initials(issue.assignee),
-        state: issue.state?.name || 'No status',
-        stateType: issue.state?.type || 'backlog',
-        health: issueHealth(issue),
-        progress: issue.state?.type === 'completed' ? 100 : issue.state?.type === 'started' ? 50 : 0,
-        priority: issue.priorityLabel || 'No priority',
-        updatedAt: issue.updatedAt,
-      })
-    }
-    projectMap.set(project.id, {
-      id: project.id,
-      name: project.name,
-      description: project.description,
-      url: project.url,
-      color: project.color,
-      health: normalizeHealth(project.health),
-      progress: Math.round((project.progress || 0) * 100),
-      owner: project.lead?.displayName || project.lead?.name || 'Unassigned',
-      ownerInitials: initials(project.lead),
-      initiativeIds: [...initiativeIds],
-      teamIds: teams.map(team => team.id),
-      teams,
-      issueIds,
-      issueCountHistory: project.issueCountHistory || [],
-      completedIssueCountHistory: project.completedIssueCountHistory || [],
-      issuesTruncated: project.issues.pageInfo.hasNextPage,
-      updatedAt: project.updatedAt,
-    })
-  }
-
-  const projects = [...projectMap.values()]
+function normalizeWorkspace(viewer, rawInitiatives) {
   const initiatives = rawInitiatives.map(initiative => {
-    const projectIds = projects.filter(project => project.initiativeIds.includes(initiative.id)).map(project => project.id)
-    const linkedProjects = projectIds.map(id => projectMap.get(id))
-    const teams = [...new Map(linkedProjects.flatMap(project => project.teams).map(team => [team.id, team])).values()]
-    const progress = linkedProjects.length
-      ? Math.round(linkedProjects.reduce((sum, project) => sum + project.progress, 0) / linkedProjects.length)
-      : initiative.status === 'Completed' ? 100 : 0
+    const leadTeam = initiative.leadTeam ? { id: initiative.leadTeam.id, name: initiative.leadTeam.name, key: initiative.leadTeam.key } : null
     return {
       id: initiative.id,
       name: initiative.name,
@@ -127,10 +94,10 @@ function normalize(viewer, rawInitiatives, rawProjects, truncated) {
       targetDate: initiative.targetDate,
       owner: initiative.owner?.displayName || initiative.owner?.name || 'Unassigned',
       parentId: initiative.parentInitiative?.id || null,
-      projectIds,
-      teamIds: teams.map(team => team.id),
-      teams,
-      progress,
+      projectIds: [],
+      teamIds: leadTeam ? [leadTeam.id] : [],
+      teams: leadTeam ? [leadTeam] : [],
+      progress: initiative.status === 'Completed' ? 100 : 0,
       updatedAt: initiative.updatedAt,
     }
   })
@@ -162,19 +129,62 @@ function normalize(viewer, rawInitiatives, rawProjects, truncated) {
     workspace: viewer.organization?.name || 'Linear workspace',
     viewer: viewer.displayName || viewer.name,
     initiatives,
-    projects,
-    issues: [...issueMap.values()],
     rootIds: initiatives.filter(item => !item.parentId).map(item => item.id),
-    truncated: truncated || projects.some(project => project.issuesTruncated),
     syncedAt: new Date().toISOString(),
   }
 }
 
-async function execute(token, query, variables) {
+function normalizeProject(project, issueIds) {
+  const teams = project.teams.nodes.map(team => ({ id: team.id, name: team.name, key: team.key }))
+  return {
+    id: project.id,
+    name: project.name,
+    description: project.description,
+    url: project.url,
+    color: project.color,
+    health: normalizeHealth(project.health),
+    progress: Math.round((project.progress || 0) * 100),
+    owner: project.lead?.displayName || project.lead?.name || 'Unassigned',
+    ownerInitials: initials(project.lead),
+    initiativeIds: project.initiatives.nodes.map(item => item.id),
+    teamIds: teams.map(team => team.id),
+    teams,
+    issueIds,
+    issueCountHistory: project.issueCountHistory || [],
+    completedIssueCountHistory: project.completedIssueCountHistory || [],
+    issuesTruncated: false,
+    updatedAt: project.updatedAt,
+  }
+}
+
+function normalizeIssue(issue) {
+  return {
+    id: issue.id,
+    identifier: issue.identifier,
+    title: issue.title,
+    url: issue.url,
+    projectId: issue.project.id,
+    team: issue.team?.name || issue.team?.key || 'Team',
+    cycleId: issue.cycle?.id || null,
+    cycleName: issue.cycle?.name || (issue.cycle?.number ? `Cycle ${issue.cycle.number}` : 'Unnamed cycle'),
+    cycleNumber: issue.cycle?.number || null,
+    owner: issue.assignee?.displayName || issue.assignee?.name || 'Unassigned',
+    ownerInitials: initials(issue.assignee),
+    state: issue.state?.name || 'No status',
+    stateType: issue.state?.type || 'backlog',
+    health: issueHealth(issue),
+    progress: issue.state?.type === 'completed' ? 100 : issue.state?.type === 'started' ? 50 : 0,
+    priority: issue.priorityLabel || 'No priority',
+    updatedAt: issue.updatedAt,
+  }
+}
+
+async function execute(token, query, variables, signal) {
   const response = await fetch(LINEAR_ENDPOINT, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: token },
     body: JSON.stringify({ query, variables }),
+    signal,
   })
   const body = await response.json().catch(() => null)
   if (!response.ok || body?.errors?.length) {
@@ -185,24 +195,48 @@ async function execute(token, query, variables) {
   return body.data
 }
 
-export async function loadLinearTree(token) {
+export async function loadLinearWorkspace(token, signal) {
   let viewer = null
   let after = null
   const initiatives = []
   do {
-    const data = await execute(token, INITIATIVES_QUERY, { after })
+    const data = await execute(token, INITIATIVES_QUERY, { after }, signal)
     viewer ||= data.viewer
     initiatives.push(...data.initiatives.nodes)
     after = data.initiatives.pageInfo.hasNextPage ? data.initiatives.pageInfo.endCursor : null
-  } while (after && initiatives.length < 500)
+  } while (after)
+  return normalizeWorkspace(viewer, initiatives)
+}
 
-  after = null
-  const projects = []
-  do {
-    const data = await execute(token, PROJECTS_QUERY, { after })
-    projects.push(...data.projects.nodes)
-    after = data.projects.pageInfo.hasNextPage ? data.projects.pageInfo.endCursor : null
-  } while (after && projects.length < 400)
+export async function loadLinearExecution(token, initiativeIds, signal) {
+  const rawProjectMap = new Map()
+  for (const initiativeIdChunk of chunks(initiativeIds)) {
+    let after = null
+    do {
+      const data = await execute(token, PROJECTS_QUERY, { after, initiativeIds: initiativeIdChunk }, signal)
+      for (const project of data.projects.nodes) rawProjectMap.set(project.id, project)
+      after = data.projects.pageInfo.hasNextPage ? data.projects.pageInfo.endCursor : null
+    } while (after)
+  }
 
-  return normalize(viewer, initiatives, projects, Boolean(after))
+  const rawIssueMap = new Map()
+  const projectIds = [...rawProjectMap.keys()]
+  for (const projectIdChunk of chunks(projectIds)) {
+    let after = null
+    do {
+      const data = await execute(token, ISSUES_QUERY, { after, projectIds: projectIdChunk }, signal)
+      for (const issue of data.issues.nodes) rawIssueMap.set(issue.id, issue)
+      after = data.issues.pageInfo.hasNextPage ? data.issues.pageInfo.endCursor : null
+    } while (after)
+  }
+
+  const issues = [...rawIssueMap.values()].map(normalizeIssue)
+  const issueIdsByProject = new Map()
+  for (const issue of issues) {
+    const ids = issueIdsByProject.get(issue.projectId) || []
+    ids.push(issue.id)
+    issueIdsByProject.set(issue.projectId, ids)
+  }
+  const projects = [...rawProjectMap.values()].map(project => normalizeProject(project, issueIdsByProject.get(project.id) || []))
+  return { projects, issues, initiativeIds, syncedAt: new Date().toISOString(), truncated: false }
 }

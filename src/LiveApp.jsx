@@ -6,7 +6,7 @@ import {
   MoreHorizontal, PanelLeftClose, Plus, RefreshCw, Search, Settings2, Sparkles,
   Target, Users, X, Columns3, Rows3, Layers3,
 } from 'lucide-react'
-import { loadLinearTree } from './linearApi'
+import { loadLinearExecution, loadLinearWorkspace } from './linearApi'
 
 const healthMeta = {
   ontrack: { label: 'On track', color: '#3b9b70' },
@@ -18,6 +18,49 @@ const healthMeta = {
 const SELECTION_STORAGE_KEY = 'linear-initiative-tree:selected-roots:v1'
 const GROUPING_STORAGE_KEY = 'linear-initiative-tree:project-grouping:v1'
 const TOKEN_STORAGE_KEY = 'linear-initiative-tree:linear-token:v1'
+const EMPTY_EXECUTION = { projects: [], issues: [], initiativeIds: [], syncedAt: null, truncated: false }
+
+function collectInitiativeSubtreeIds(initiatives, rootIds) {
+  const childrenByParent = new Map()
+  for (const initiative of initiatives) {
+    const children = childrenByParent.get(initiative.parentId) || []
+    children.push(initiative.id)
+    childrenByParent.set(initiative.parentId, children)
+  }
+  const result = new Set()
+  const visit = id => {
+    if (result.has(id)) return
+    result.add(id)
+    for (const childId of childrenByParent.get(id) || []) visit(childId)
+  }
+  rootIds.forEach(visit)
+  return [...result]
+}
+
+function combineWorkspaceExecution(workspace, execution) {
+  if (!workspace) return null
+  const projectMap = new Map(execution.projects.map(project => [project.id, project]))
+  const initiatives = workspace.initiatives.map(initiative => {
+    const projectIds = execution.projects.filter(project => project.initiativeIds.includes(initiative.id)).map(project => project.id)
+    const linkedProjects = projectIds.map(id => projectMap.get(id))
+    return {
+      ...initiative,
+      projectIds,
+      progress: linkedProjects.length
+        ? Math.round(linkedProjects.reduce((sum, project) => sum + project.progress, 0) / linkedProjects.length)
+        : initiative.status === 'Completed' ? 100 : 0,
+    }
+  })
+  return {
+    ...workspace,
+    initiatives,
+    projects: execution.projects,
+    issues: execution.issues,
+    loadedInitiativeIds: execution.initiativeIds,
+    truncated: execution.truncated,
+    syncedAt: execution.syncedAt || workspace.syncedAt,
+  }
+}
 
 function readStoredToken() {
   try { return window.localStorage.getItem(TOKEN_STORAGE_KEY) || '' } catch { return '' }
@@ -106,11 +149,11 @@ function fuzzyScore(label, query) {
   return score + haystack.length * .01
 }
 
-function FuzzyInitiativeFilter({ icon: Icon, value, options, allLabel, searchLabel, onChange, title }) {
+function FuzzyMultiFilter({ icon: Icon, values, options, allLabel, pluralLabel, searchLabel, onChange, title }) {
   const [open, setOpen] = useState(false)
   const [query, setQuery] = useState('')
   const ref = useRef(null)
-  const selected = options.find(option => option.value === value)
+  const selected = values.length === 1 ? options.find(option => option.value === values[0]) : null
   const matches = options
     .map(option => ({ option, score: fuzzyScore(option.searchText || option.label, query) }))
     .filter(item => item.score !== null)
@@ -123,21 +166,19 @@ function FuzzyInitiativeFilter({ icon: Icon, value, options, allLabel, searchLab
     return () => document.removeEventListener('mousedown', closeOnOutsideClick)
   }, [open])
 
-  const choose = nextValue => {
-    onChange(nextValue)
-    setOpen(false)
-    setQuery('')
-  }
+  const toggleValue = nextValue => onChange(values.includes(nextValue) ? values.filter(value => value !== nextValue) : [...values, nextValue])
+  const triggerLabel = !values.length ? allLabel : selected?.label || `${values.length} ${pluralLabel}`
 
-  return <div className={`initiative-fuzzy-filter ${value !== 'all' ? 'active' : ''}`} ref={ref} title={title}>
-    <button type="button" className="initiative-filter-trigger" onClick={() => setOpen(current => !current)} aria-expanded={open}><Icon size={13} /><span>{selected?.label || allLabel}</span><ChevronDown size={11} /></button>
+  return <div className={`initiative-fuzzy-filter ${values.length ? 'active' : ''}`} ref={ref} title={title}>
+    <button type="button" className="initiative-filter-trigger" onClick={() => setOpen(current => !current)} aria-expanded={open}><Icon size={13} /><span>{triggerLabel}</span>{values.length > 1 && <b>{values.length}</b>}<ChevronDown size={11} /></button>
     {open && <div className="initiative-filter-menu" onKeyDown={event => { if (event.key === 'Escape') setOpen(false) }}>
       <div className="initiative-filter-search"><Search size={13} /><input autoFocus value={query} onChange={event => setQuery(event.target.value)} placeholder={searchLabel} aria-label={searchLabel} />{query && <button type="button" onClick={() => setQuery('')}><X size={12} /></button>}</div>
       <div className="initiative-filter-options">
-        <button type="button" className={value === 'all' ? 'selected' : ''} onClick={() => choose('all')}><span>{allLabel}</span>{value === 'all' && <Check size={12} />}</button>
-        {matches.map(({ option }) => <button type="button" key={option.value} className={value === option.value ? 'selected' : ''} onClick={() => choose(option.value)} title={option.label}><span>{option.label}</span>{value === option.value && <Check size={12} />}</button>)}
+        <button type="button" className={!values.length ? 'selected' : ''} onClick={() => onChange([])}><span>{allLabel}</span>{!values.length && <Check size={12} />}</button>
+        {matches.map(({ option }) => <button type="button" key={option.value} className={values.includes(option.value) ? 'selected' : ''} onClick={() => toggleValue(option.value)} title={option.label}><span>{option.label}</span>{values.includes(option.value) && <Check size={12} />}</button>)}
         {!matches.length && <div className="initiative-filter-empty">No matches</div>}
       </div>
+      <button type="button" className="initiative-filter-done" onClick={() => { setOpen(false); setQuery('') }}>Done</button>
     </div>}
   </div>
 }
@@ -145,20 +186,24 @@ function FuzzyInitiativeFilter({ icon: Icon, value, options, allLabel, searchLab
 function InitiativesScreen({ data, selectedIds, onToggle, onViewTree }) {
   const [search, setSearch] = useState('')
   const [health, setHealth] = useState('all')
-  const [owner, setOwner] = useState('all')
-  const [team, setTeam] = useState('all')
+  const [ownersSelected, setOwnersSelected] = useState([])
+  const [teamsSelected, setTeamsSelected] = useState([])
   const rootInitiatives = data.rootIds
     .map(id => data.initiatives.find(item => item.id === id))
     .filter(Boolean)
   const owners = [...new Set(rootInitiatives.map(item => item.owner))].sort((a, b) => a.localeCompare(b))
   const teams = [...new Map(rootInitiatives.flatMap(item => item.teams || []).map(item => [item.id, item])).values()].sort((a, b) => a.name.localeCompare(b.name))
   const ownerOptions = owners.map(name => ({ value: name, label: name }))
-  const teamOptions = [...teams.map(item => ({ value: item.id, label: item.name, searchText: `${item.name} ${item.key || ''}` })), { value: 'none', label: 'No project team' }]
+  const teamOptions = [...teams.map(item => ({ value: item.id, label: item.name, searchText: `${item.name} ${item.key || ''}` })), { value: 'none', label: 'No lead team' }]
+  const ownerOptionKey = ownerOptions.map(option => option.value).join('|')
+  const teamOptionKey = teamOptions.map(option => option.value).join('|')
+  useEffect(() => setOwnersSelected(current => current.filter(value => ownerOptions.some(option => option.value === value))), [ownerOptionKey])
+  useEffect(() => setTeamsSelected(current => current.filter(value => teamOptions.some(option => option.value === value))), [teamOptionKey])
   const initiatives = rootInitiatives
     .filter(item => !search || `${item.name} ${item.owner} ${(item.teams || []).map(entry => entry.name).join(' ')} ${item.description || ''}`.toLowerCase().includes(search.toLowerCase()))
     .filter(item => health === 'all' || item.health === health)
-    .filter(item => owner === 'all' || item.owner === owner)
-    .filter(item => team === 'all' || (team === 'none' ? !item.teamIds?.length : item.teamIds?.includes(team)))
+    .filter(item => !ownersSelected.length || ownersSelected.includes(item.owner))
+    .filter(item => !teamsSelected.length || teamsSelected.some(team => team === 'none' ? !item.teamIds?.length : item.teamIds?.includes(team)))
     .sort((a, b) => a.name.localeCompare(b.name))
   return <main className="main initiatives-main">
     <header className="topbar"><div className="breadcrumbs"><span>{data.workspace}</span><ChevronRight size={13} /><b>Initiatives</b></div><div className="top-actions"><button disabled title="Not implemented"><Settings2 size={16} /></button><button className="share" onClick={onViewTree}>View selected tree</button></div></header>
@@ -166,8 +211,8 @@ function InitiativesScreen({ data, selectedIds, onToggle, onViewTree }) {
     <section className="initiatives-toolbar">
       <div className="search-box initiative-search"><Search size={15} /><input value={search} onChange={event => setSearch(event.target.value)} placeholder="Search initiatives…" />{search && <button onClick={() => setSearch('')}><X size={13} /></button>}</div>
       <div className="health-chips"><button className={health === 'all' ? 'selected' : ''} onClick={() => setHealth('all')}>All</button>{Object.entries(healthMeta).map(([key, meta]) => <button key={key} className={health === key ? 'selected' : ''} onClick={() => setHealth(key)}><i style={{ background: meta.color }} />{meta.label}</button>)}</div>
-      <FuzzyInitiativeFilter icon={Users} value={owner} options={ownerOptions} allLabel="All owners" searchLabel="Find an owner…" onChange={setOwner} />
-      <FuzzyInitiativeFilter icon={Building2} value={team} options={teamOptions} allLabel="All teams" searchLabel="Find a team…" onChange={setTeam} title="Teams are derived from projects across the initiative hierarchy" />
+      <FuzzyMultiFilter icon={Users} values={ownersSelected} options={ownerOptions} allLabel="All owners" pluralLabel="owners" searchLabel="Find an owner…" onChange={setOwnersSelected} />
+      <FuzzyMultiFilter icon={Building2} values={teamsSelected} options={teamOptions} allLabel="All teams" pluralLabel="teams" searchLabel="Find a team…" onChange={setTeamsSelected} title="Teams are derived from initiative lead teams across the hierarchy" />
       <span className="initiative-result-count">{initiatives.length} initiatives</span>
     </section>
     <div className="initiatives-scroll">
@@ -179,7 +224,7 @@ function InitiativesScreen({ data, selectedIds, onToggle, onViewTree }) {
             <h3>{item.name}</h3>
             <p>{item.description || 'No description has been added in Linear.'}</p>
             <div className="initiative-grid-progress"><div><span>Progress</span><strong>{item.progress}%</strong></div><Progress value={item.progress} color={item.color || healthMeta[item.health]?.color} /></div>
-            <div className="initiative-card-footer"><span className="person"><i>{item.owner.slice(0, 2).toUpperCase()}</i>{item.owner}</span><span><Box size={12} />{item.projectIds.length} projects</span><a href={item.url} target="_blank" rel="noreferrer" onClick={event => event.stopPropagation()}><ArrowUpRight size={13} /></a></div>
+            <div className="initiative-card-footer"><span className="person"><i>{item.owner.slice(0, 2).toUpperCase()}</i>{item.owner}</span><span><Box size={12} />{data.loadedInitiativeIds.includes(item.id) ? `${item.projectIds.length} projects` : 'Load in tree'}</span><a href={item.url} target="_blank" rel="noreferrer" onClick={event => event.stopPropagation()}><ArrowUpRight size={13} /></a></div>
           </article>
         })}
       </div>
@@ -278,10 +323,13 @@ function ShelfSummary({ shelf, pos, orientation, onExpand }) {
 
 export default function LiveApp() {
   const [apiToken, setApiToken] = useState(readStoredToken)
-  const [data, setData] = useState(null)
+  const [workspaceData, setWorkspaceData] = useState(null)
+  const [executionData, setExecutionData] = useState(EMPTY_EXECUTION)
   const [view, setView] = useState('tree')
   const [error, setError] = useState(null)
   const [loading, setLoading] = useState(true)
+  const [executionLoading, setExecutionLoading] = useState(false)
+  const [executionError, setExecutionError] = useState(null)
   const [rootIds, setRootIds] = useState(readStoredSelection)
   const [orientation, setOrientation] = useState('horizontal')
   const [rootPickerOpen, setRootPickerOpen] = useState(false)
@@ -291,7 +339,8 @@ export default function LiveApp() {
   const [selection, setSelection] = useState(null)
   const [query, setQuery] = useState('')
   const [healthFilter, setHealthFilter] = useState('all')
-  const [cycleFilter, setCycleFilter] = useState('all')
+  const [cycleFilters, setCycleFilters] = useState([])
+  const [cycleQuery, setCycleQuery] = useState('')
   const [filterOpen, setFilterOpen] = useState(false)
   const [zoom, setZoom] = useState(1)
   const [projectGrouping, setProjectGrouping] = useState(readStoredGrouping)
@@ -299,8 +348,14 @@ export default function LiveApp() {
   const [viewportWindow, setViewportWindow] = useState(null)
   const viewportRef = useRef(null)
   const gestureStartZoomRef = useRef(1)
+  const executionRequestRef = useRef(0)
+  const executionAbortRef = useRef(null)
+  const data = useMemo(() => combineWorkspaceExecution(workspaceData, executionData), [workspaceData, executionData])
 
   async function load(token = apiToken) {
+    executionRequestRef.current += 1
+    executionAbortRef.current?.abort()
+    setExecutionLoading(false)
     if (!token) {
       setLoading(false)
       setError({ code: 'NOT_CONFIGURED', message: 'Connect a Linear workspace.' })
@@ -308,25 +363,51 @@ export default function LiveApp() {
     }
     setLoading(true); setError(null)
     try {
-      const body = await loadLinearTree(token)
-      setData(body)
+      const body = await loadLinearWorkspace(token)
+      setWorkspaceData(body)
+      setExecutionData(EMPTY_EXECUTION)
       const roots = body.rootIds.map(id => body.initiatives.find(item => item.id === id)).filter(Boolean)
-      const initial = roots.sort((a, b) => b.projectIds.length - a.projectIds.length)[0]
+      const initial = roots[0]
       setRootIds(current => {
         const valid = current.filter(id => body.rootIds.includes(id))
         return valid.length ? valid : initial ? [initial.id] : []
       })
-      setCollapsedProjects(new Set(body.projects.map(item => item.id)))
       setApiToken(token)
       try { window.localStorage.setItem(TOKEN_STORAGE_KEY, token) } catch { /* Storage can be unavailable in restricted browser contexts. */ }
       return true
     } catch (caught) {
-      setData(null)
+      setWorkspaceData(null)
+      setExecutionData(EMPTY_EXECUTION)
       setError({ code: caught.code || 'LINEAR_API_ERROR', message: caught.message || 'Unable to load Linear data.' })
       return false
     } finally { setLoading(false) }
   }
   useEffect(() => { load(apiToken) }, [])
+  useEffect(() => {
+    if (!workspaceData || !apiToken || !rootIds.length) return
+    const requestId = ++executionRequestRef.current
+    executionAbortRef.current?.abort()
+    const controller = new AbortController()
+    executionAbortRef.current = controller
+    const initiativeIds = collectInitiativeSubtreeIds(workspaceData.initiatives, rootIds)
+    setExecutionLoading(true)
+    setExecutionError(null)
+    setExecutionData(EMPTY_EXECUTION)
+    loadLinearExecution(apiToken, initiativeIds, controller.signal).then(body => {
+      if (requestId !== executionRequestRef.current) return
+      setExecutionData(body)
+      setCollapsedProjects(new Set(body.projects.map(item => item.id)))
+      const validCycles = new Set(body.issues.map(issue => issue.cycleId).filter(Boolean))
+      setCycleFilters(current => current.filter(id => id === 'none' || validCycles.has(id)))
+    }).catch(caught => {
+      if (caught.name === 'AbortError') return
+      if (requestId !== executionRequestRef.current) return
+      setExecutionError(caught.message || 'Unable to load selected Linear work.')
+    }).finally(() => {
+      if (requestId === executionRequestRef.current) setExecutionLoading(false)
+    })
+    return () => controller.abort()
+  }, [workspaceData, apiToken, rootIds])
   useEffect(() => {
     if (!rootIds.length) return
     try { window.localStorage.setItem(SELECTION_STORAGE_KEY, JSON.stringify(rootIds)) } catch { /* Storage can be unavailable in restricted browser contexts. */ }
@@ -359,7 +440,8 @@ export default function LiveApp() {
     if (!roots.length) return null
     const selectedSet = new Set(rootIds)
     const branches = roots.flatMap(root => {
-      const children = data.initiatives.filter(item => item.parentId === root.id && !selectedSet.has(item.id))
+      const descendantIds = new Set(collectInitiativeSubtreeIds(data.initiatives, [root.id]))
+      const children = data.initiatives.filter(item => item.id !== root.id && descendantIds.has(item.id) && !selectedSet.has(item.id))
       const items = children.length
         ? children.map(item => ({ ...item, id: `branch:${root.id}:${item.id}`, sourceId: item.id, rootId: root.id }))
         : [{ ...root, id: `branch:${root.id}`, sourceId: root.id, rootId: root.id }]
@@ -367,8 +449,8 @@ export default function LiveApp() {
       return items
     })
     const branchProjectIds = new Set(branches.flatMap(item => item.projectIds))
-    const issueMatchesCycle = issue => cycleFilter === 'all' || (cycleFilter === 'none' ? !issue.cycleId : issue.cycleId === cycleFilter)
-    const projectsWithMatchingIssues = cycleFilter === 'all' ? null : new Set(data.issues.filter(issueMatchesCycle).map(issue => issue.projectId))
+    const issueMatchesCycle = issue => !cycleFilters.length || cycleFilters.some(cycleId => cycleId === 'none' ? !issue.cycleId : issue.cycleId === cycleId)
+    const projectsWithMatchingIssues = !cycleFilters.length ? null : new Set(data.issues.filter(issueMatchesCycle).map(issue => issue.projectId))
     const projects = data.projects.filter(item => branchProjectIds.has(item.id) && (!projectsWithMatchingIssues || projectsWithMatchingIssues.has(item.id)))
     const openBranchSources = new Set(branches.filter(item => !collapsedInitiatives.has(item.id)).map(item => item.sourceId))
     const rootRank = new Map(roots.map((root, index) => [root.id, index]))
@@ -447,7 +529,7 @@ export default function LiveApp() {
       width: orientation === 'vertical' ? Math.max(1450, baseHeight) : baseWidth,
       height: orientation === 'vertical' ? baseWidth : baseHeight,
     }
-  }, [data, rootIds, collapsedInitiatives, collapsedProjects, orientation, zoom, expandedShelves, projectGrouping, cycleFilter])
+  }, [data, rootIds, collapsedInitiatives, collapsedProjects, orientation, zoom, expandedShelves, projectGrouping, cycleFilters])
 
   const updateViewportWindow = () => {
     const viewport = viewportRef.current
@@ -535,9 +617,12 @@ export default function LiveApp() {
   tree.issues.forEach(issue => edges.push(makeEdge(tree.projectPos.get(issue.projectId), tree.issuePos.get(issue.id), 'project', 'issue', issue.health)))
 
   const rootOptions = data.rootIds.map(id => data.initiatives.find(item => item.id === id)).filter(Boolean).sort((a,b) => a.name.localeCompare(b.name))
-  const cycleOptions = [...new Map(data.issues.filter(issue => issue.cycleId).map(issue => [issue.cycleId, { id: issue.cycleId, name: issue.cycleName, number: issue.cycleNumber, team: issue.team }])).values()]
+  const cycleOptions = [...new Map(data.issues.filter(issue => issue.cycleId).map(issue => [issue.cycleId, { value: issue.cycleId, label: `${issue.cycleName} · ${issue.team}`, name: issue.cycleName, number: issue.cycleNumber, team: issue.team }])).values()]
     .sort((a, b) => (b.number || 0) - (a.number || 0) || a.name.localeCompare(b.name) || a.team.localeCompare(b.team))
-  const activeFilterCount = Number(healthFilter !== 'all') + Number(cycleFilter !== 'all')
+  cycleOptions.push({ value: 'none', label: 'No cycle', name: 'No cycle', number: -1, team: '' })
+  const matchingCycleOptions = cycleOptions.map(option => ({ option, score: fuzzyScore(option.label, cycleQuery) })).filter(item => item.score !== null).sort((a, b) => a.score - b.score || a.option.label.localeCompare(b.option.label))
+  const activeFilterCount = Number(healthFilter !== 'all') + Number(cycleFilters.length > 0)
+  const toggleCycle = cycleId => setCycleFilters(current => current.includes(cycleId) ? current.filter(id => id !== cycleId) : [...current, cycleId])
   const filteredRootOptions = rootOptions.filter(item => item.name.toLowerCase().includes(initiativeQuery.toLowerCase()))
   const toggleRoot = id => {
     setRootIds(previous => previous.includes(id) ? (previous.length === 1 ? previous : previous.filter(item => item !== id)) : [...previous, id])
@@ -547,21 +632,22 @@ export default function LiveApp() {
   return <div className="app-shell">
     <Sidebar workspace={data.workspace} viewer={data.viewer} activeView={view} onNavigate={setView} onForgetToken={() => {
       try { window.localStorage.removeItem(TOKEN_STORAGE_KEY) } catch { /* Storage can be unavailable in restricted browser contexts. */ }
-      setApiToken(''); setData(null); setSelection(null); setError({ code: 'NOT_CONFIGURED', message: 'Connect a Linear workspace.' })
+      executionRequestRef.current += 1
+      setApiToken(''); setWorkspaceData(null); setExecutionData(EMPTY_EXECUTION); setSelection(null); setError({ code: 'NOT_CONFIGURED', message: 'Connect a Linear workspace.' })
     }} />
     {view === 'initiatives' ? <InitiativesScreen data={data} selectedIds={rootIds} onToggle={toggleRoot} onViewTree={() => setView('tree')} /> : <>
     <main className="main">
       <header className="topbar"><div className="breadcrumbs"><span>{data.workspace}</span><ChevronRight size={13} /><span>Initiatives</span><ChevronRight size={13} /><b>{tree.roots.length === 1 ? tree.roots[0].name : `${tree.roots.length} initiatives`}</b></div><div className="top-actions"><button disabled title="Not implemented"><Focus size={16} /></button><button disabled title="Not implemented"><Settings2 size={16} /></button>{tree.roots.length === 1 && <button className="share" onClick={() => window.open(tree.roots[0].url, '_blank')}>Open in Linear</button>}</div></header>
-      <section className="page-heading"><div><div className="title-row"><h1>Initiative tree</h1><span className="live"><i /> LIVE</span></div><p>Trace strategic initiatives into their projects and active issues.</p></div><div className="sync"><Check size={13} /> Synced {new Date(data.syncedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}{data.truncated && <span className="truncated"> · Large workspace, newest records shown</span>}</div></section>
+      <section className="page-heading"><div><div className="title-row"><h1>Initiative tree</h1><span className="live"><i /> LIVE</span></div><p>Trace strategic initiatives into their projects and active issues.</p></div><div className={`sync ${executionError ? 'sync-error' : ''}`}>{executionLoading ? <><LoaderCircle size={13} className="spin" /> Loading selected work…</> : executionError ? <><X size={13} />{executionError}</> : <><Check size={13} /> Synced {new Date(data.syncedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</>}</div></section>
       <section className="toolbar">
-        <div className="root-picker-wrap"><button className="root-picker-button" onClick={() => setRootPickerOpen(value => !value)}><Goal size={14} /><span>{rootIds.length === 1 ? tree.roots[0].name : `${rootIds.length} initiatives`}</span><span className="selection-count">{rootIds.length}</span><ChevronDown size={13} /></button>{rootPickerOpen && <div className="root-picker-menu"><div className="root-picker-search"><Search size={14} /><input value={initiativeQuery} onChange={event => setInitiativeQuery(event.target.value)} placeholder="Find initiatives…" /></div><div className="root-picker-actions"><button onClick={() => setRootIds(rootOptions.slice(0, 8).map(item => item.id))}>Select first 8</button><button onClick={() => setRootIds([rootOptions[0].id])}>Clear</button></div><div className="root-picker-list">{filteredRootOptions.map(item => <label key={item.id}><input type="checkbox" checked={rootIds.includes(item.id)} onChange={() => toggleRoot(item.id)} /><span className="custom-check">{rootIds.includes(item.id) && <Check size={11} />}</span><span title={item.name}>{item.name}</span><small>{item.projectIds.length}</small></label>)}</div><div className="root-picker-footer">{rootIds.length} selected · Shared projects are shown once</div></div>}</div>
+        <div className="root-picker-wrap"><button className="root-picker-button" onClick={() => setRootPickerOpen(value => !value)}><Goal size={14} /><span>{rootIds.length === 1 ? tree.roots[0].name : `${rootIds.length} initiatives`}</span><span className="selection-count">{rootIds.length}</span><ChevronDown size={13} /></button>{rootPickerOpen && <div className="root-picker-menu"><div className="root-picker-search"><Search size={14} /><input value={initiativeQuery} onChange={event => setInitiativeQuery(event.target.value)} placeholder="Find initiatives…" /></div><div className="root-picker-actions"><button onClick={() => setRootIds(rootOptions.slice(0, 8).map(item => item.id))}>Select first 8</button><button onClick={() => setRootIds([rootOptions[0].id])}>Clear</button></div><div className="root-picker-list">{filteredRootOptions.map(item => <label key={item.id}><input type="checkbox" checked={rootIds.includes(item.id)} onChange={() => toggleRoot(item.id)} /><span className="custom-check">{rootIds.includes(item.id) && <Check size={11} />}</span><span title={item.name}>{item.name}</span><small>{data.loadedInitiativeIds.includes(item.id) ? item.projectIds.length : '—'}</small></label>)}</div><div className="root-picker-footer">{rootIds.length} selected · Shared projects are shown once</div></div>}</div>
         <div className="orientation-toggle" aria-label="Tree orientation"><button className={orientation === 'horizontal' ? 'selected' : ''} onClick={() => setOrientation('horizontal')} title="Left to right"><Columns3 size={14} /></button><button className={orientation === 'vertical' ? 'selected' : ''} onClick={() => setOrientation('vertical')} title="Top to bottom"><Rows3 size={14} /></button></div>
         <label className="grouping-control"><Layers3 size={14} /><span>Group</span><select value={projectGrouping} onChange={event => setProjectGrouping(event.target.value)}><option value="health">Health</option><option value="owner">Project lead</option><option value="none">None</option></select><ChevronDown size={12} /></label>
         <div className="search-box"><Search size={15} /><input value={query} onChange={event => setQuery(event.target.value)} placeholder="Search this tree…" />{query && <button onClick={() => setQuery('')}><X size={13} /></button>}</div>
-        <div className="filter-wrap"><button className={activeFilterCount ? 'active-filter' : ''} onClick={() => setFilterOpen(!filterOpen)}><Filter size={14} /> Filters{activeFilterCount > 0 && <span className="filter-count">{activeFilterCount}</span>}<ChevronDown size={13} /></button>{filterOpen && <div className="filter-menu tree-filter-menu"><span className="filter-heading">Health</span>{['all', ...Object.keys(healthMeta)].map(health => <button key={health} onClick={() => setHealthFilter(health)} className={healthFilter === health ? 'selected' : ''}>{health === 'all' ? <Crosshair size={14} /> : <Status health={health} compact />}{health === 'all' ? 'All health' : healthMeta[health].label}{healthFilter === health && <Check size={13} />}</button>)}<span className="filter-heading cycle-heading">Issue cycle</span><label className="cycle-filter"><CircleDot size={14} /><select value={cycleFilter} onChange={event => setCycleFilter(event.target.value)} aria-label="Filter issues by cycle"><option value="all">All cycles</option>{cycleOptions.map(cycle => <option key={cycle.id} value={cycle.id}>{cycle.name} · {cycle.team}</option>)}<option value="none">No cycle</option></select><ChevronDown size={12} /></label>{activeFilterCount > 0 && <button className="clear-tree-filters" onClick={() => { setHealthFilter('all'); setCycleFilter('all') }}><X size={13} />Clear filters</button>}</div>}</div>
+        <div className="filter-wrap"><button className={activeFilterCount ? 'active-filter' : ''} onClick={() => setFilterOpen(!filterOpen)}><Filter size={14} /> Filters{activeFilterCount > 0 && <span className="filter-count">{activeFilterCount}</span>}<ChevronDown size={13} /></button>{filterOpen && <div className="filter-menu tree-filter-menu"><span className="filter-heading">Health</span>{['all', ...Object.keys(healthMeta)].map(health => <button key={health} onClick={() => setHealthFilter(health)} className={healthFilter === health ? 'selected' : ''}>{health === 'all' ? <Crosshair size={14} /> : <Status health={health} compact />}{health === 'all' ? 'All health' : healthMeta[health].label}{healthFilter === health && <Check size={13} />}</button>)}<span className="filter-heading cycle-heading">Issue cycles {cycleFilters.length > 0 && <b>{cycleFilters.length}</b>}</span><div className="cycle-multi-search"><Search size={13} /><input value={cycleQuery} onChange={event => setCycleQuery(event.target.value)} placeholder="Find cycles…" />{cycleQuery && <button onClick={() => setCycleQuery('')}><X size={12} /></button>}</div><div className="cycle-filter-options"><button className={!cycleFilters.length ? 'selected' : ''} onClick={() => setCycleFilters([])}><span>All cycles</span>{!cycleFilters.length && <Check size={12} />}</button>{matchingCycleOptions.map(({ option }) => <button key={option.value} className={cycleFilters.includes(option.value) ? 'selected' : ''} onClick={() => toggleCycle(option.value)} title={option.label}><span>{option.label}</span>{cycleFilters.includes(option.value) && <Check size={12} />}</button>)}</div>{activeFilterCount > 0 && <button className="clear-tree-filters" onClick={() => { setHealthFilter('all'); setCycleFilters([]); setCycleQuery('') }}><X size={13} />Clear filters</button>}</div>}</div>
         <button onClick={() => { setCollapsedInitiatives(new Set()); setCollapsedProjects(new Set()) }}><Maximize2 size={14} /> Expand all</button>
         <button onClick={() => setCollapsedProjects(new Set(data.projects.map(item => item.id)))}><Minus size={14} /> Hide issues</button>
-        <button onClick={() => load(apiToken)} disabled={loading}><RefreshCw size={14} className={loading ? 'spin' : ''} /> Refresh</button>
+        <button onClick={() => load(apiToken)} disabled={loading || executionLoading}><RefreshCw size={14} className={loading || executionLoading ? 'spin' : ''} /> Refresh</button>
       </section>
       <div className="canvas-viewport" ref={viewportRef} onScroll={updateViewportWindow}>
         <div className="canvas" style={{ width: tree.width * zoom, height: tree.height * zoom }}><div className="canvas-scale" style={{ width: tree.width, height: tree.height, transform: `scale(${zoom})` }}>
