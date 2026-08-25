@@ -199,7 +199,7 @@ function EmptyState({ error, onConnect }) {
       <input type="password" value={token} onChange={event => setToken(event.target.value)} placeholder="lin_api_…" autoComplete="off" spellCheck="false" aria-label="Linear personal API key" />
       <button disabled={submitting || !token.trim()}>{submitting ? <LoaderCircle size={14} className="spin" /> : <Link2 size={14} />}{submitting ? 'Connecting…' : missing ? 'Connect Linear' : 'Try another token'}</button>
     </form>
-    <p className="token-notice">Use a read-only workspace token when possible. Anyone who can run JavaScript on this page could access browser storage, so OAuth is safer for broad public use.</p>
+    <p className="token-notice">This app sends only read queries, but a personal API key may carry broader access. Anyone who can run JavaScript on this page could access browser storage, so treat the key as sensitive and prefer OAuth for broad public use.</p>
   </div>
 }
 
