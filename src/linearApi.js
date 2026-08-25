@@ -22,6 +22,7 @@ const PROJECTS_QUERY = `
         completedIssueCountHistory issueCountHistory
         lead { id name displayName }
         initiatives(first: 50) { nodes { id } }
+        teams(first: 50) { nodes { id name key } }
         issues(first: 25, orderBy: updatedAt) {
           nodes {
             id identifier title url priorityLabel updatedAt completedAt canceledAt
@@ -61,6 +62,7 @@ function normalize(viewer, rawInitiatives, rawProjects, truncated) {
 
   for (const project of rawProjects) {
     const initiativeIds = new Set(project.initiatives.nodes.map(item => item.id))
+    const teams = project.teams.nodes.map(team => ({ id: team.id, name: team.name, key: team.key }))
     const issueIds = []
     for (const issue of project.issues.nodes) {
       issueIds.push(issue.id)
@@ -92,6 +94,8 @@ function normalize(viewer, rawInitiatives, rawProjects, truncated) {
       owner: project.lead?.displayName || project.lead?.name || 'Unassigned',
       ownerInitials: initials(project.lead),
       initiativeIds: [...initiativeIds],
+      teamIds: teams.map(team => team.id),
+      teams,
       issueIds,
       issueCountHistory: project.issueCountHistory || [],
       completedIssueCountHistory: project.completedIssueCountHistory || [],
@@ -104,6 +108,7 @@ function normalize(viewer, rawInitiatives, rawProjects, truncated) {
   const initiatives = rawInitiatives.map(initiative => {
     const projectIds = projects.filter(project => project.initiativeIds.includes(initiative.id)).map(project => project.id)
     const linkedProjects = projectIds.map(id => projectMap.get(id))
+    const teams = [...new Map(linkedProjects.flatMap(project => project.teams).map(team => [team.id, team])).values()]
     const progress = linkedProjects.length
       ? Math.round(linkedProjects.reduce((sum, project) => sum + project.progress, 0) / linkedProjects.length)
       : initiative.status === 'Completed' ? 100 : 0
@@ -119,10 +124,35 @@ function normalize(viewer, rawInitiatives, rawProjects, truncated) {
       owner: initiative.owner?.displayName || initiative.owner?.name || 'Unassigned',
       parentId: initiative.parentInitiative?.id || null,
       projectIds,
+      teamIds: teams.map(team => team.id),
+      teams,
       progress,
       updatedAt: initiative.updatedAt,
     }
   })
+
+  const initiativesByParent = new Map()
+  for (const initiative of initiatives) {
+    const siblings = initiativesByParent.get(initiative.parentId) || []
+    siblings.push(initiative)
+    initiativesByParent.set(initiative.parentId, siblings)
+  }
+  const hierarchyTeams = new Map()
+  function collectTeams(initiative, visited = new Set()) {
+    if (hierarchyTeams.has(initiative.id)) return hierarchyTeams.get(initiative.id)
+    if (visited.has(initiative.id)) return initiative.teams
+    const nextVisited = new Set(visited).add(initiative.id)
+    const teams = [...new Map([
+      ...initiative.teams,
+      ...(initiativesByParent.get(initiative.id) || []).flatMap(child => collectTeams(child, nextVisited)),
+    ].map(team => [team.id, team])).values()]
+    hierarchyTeams.set(initiative.id, teams)
+    return teams
+  }
+  for (const initiative of initiatives) {
+    initiative.teams = collectTeams(initiative)
+    initiative.teamIds = initiative.teams.map(team => team.id)
+  }
 
   return {
     workspace: viewer.organization?.name || 'Linear workspace',

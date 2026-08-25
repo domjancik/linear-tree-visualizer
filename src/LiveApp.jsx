@@ -92,11 +92,18 @@ function Sidebar({ workspace, viewer, activeView, onNavigate, onForgetToken }) {
 function InitiativesScreen({ data, selectedIds, onToggle, onViewTree }) {
   const [search, setSearch] = useState('')
   const [health, setHealth] = useState('all')
-  const initiatives = data.rootIds
+  const [owner, setOwner] = useState('all')
+  const [team, setTeam] = useState('all')
+  const rootInitiatives = data.rootIds
     .map(id => data.initiatives.find(item => item.id === id))
     .filter(Boolean)
-    .filter(item => !search || `${item.name} ${item.owner} ${item.description || ''}`.toLowerCase().includes(search.toLowerCase()))
+  const owners = [...new Set(rootInitiatives.map(item => item.owner))].sort((a, b) => a.localeCompare(b))
+  const teams = [...new Map(rootInitiatives.flatMap(item => item.teams || []).map(item => [item.id, item])).values()].sort((a, b) => a.name.localeCompare(b.name))
+  const initiatives = rootInitiatives
+    .filter(item => !search || `${item.name} ${item.owner} ${(item.teams || []).map(entry => entry.name).join(' ')} ${item.description || ''}`.toLowerCase().includes(search.toLowerCase()))
     .filter(item => health === 'all' || item.health === health)
+    .filter(item => owner === 'all' || item.owner === owner)
+    .filter(item => team === 'all' || (team === 'none' ? !item.teamIds?.length : item.teamIds?.includes(team)))
     .sort((a, b) => a.name.localeCompare(b.name))
   return <main className="main initiatives-main">
     <header className="topbar"><div className="breadcrumbs"><span>{data.workspace}</span><ChevronRight size={13} /><b>Initiatives</b></div><div className="top-actions"><button><Settings2 size={16} /></button><button className="share" onClick={onViewTree}>View selected tree</button></div></header>
@@ -104,6 +111,8 @@ function InitiativesScreen({ data, selectedIds, onToggle, onViewTree }) {
     <section className="initiatives-toolbar">
       <div className="search-box initiative-search"><Search size={15} /><input value={search} onChange={event => setSearch(event.target.value)} placeholder="Search initiatives…" />{search && <button onClick={() => setSearch('')}><X size={13} /></button>}</div>
       <div className="health-chips"><button className={health === 'all' ? 'selected' : ''} onClick={() => setHealth('all')}>All</button>{Object.entries(healthMeta).map(([key, meta]) => <button key={key} className={health === key ? 'selected' : ''} onClick={() => setHealth(key)}><i style={{ background: meta.color }} />{meta.label}</button>)}</div>
+      <label className={`initiative-select-filter ${owner !== 'all' ? 'active' : ''}`}><Users size={13} /><select value={owner} onChange={event => setOwner(event.target.value)} aria-label="Filter initiatives by owner"><option value="all">All owners</option>{owners.map(name => <option key={name} value={name}>{name}</option>)}</select><ChevronDown size={11} /></label>
+      <label className={`initiative-select-filter ${team !== 'all' ? 'active' : ''}`} title="Teams are derived from projects across the initiative hierarchy"><Building2 size={13} /><select value={team} onChange={event => setTeam(event.target.value)} aria-label="Filter initiatives by project team"><option value="all">All teams</option>{teams.map(item => <option key={item.id} value={item.id}>{item.name}</option>)}<option value="none">No project team</option></select><ChevronDown size={11} /></label>
       <span className="initiative-result-count">{initiatives.length} initiatives</span>
     </section>
     <div className="initiatives-scroll">
@@ -119,7 +128,7 @@ function InitiativesScreen({ data, selectedIds, onToggle, onViewTree }) {
           </article>
         })}
       </div>
-      {!initiatives.length && <div className="no-initiatives"><Search size={22} /><h3>No initiatives found</h3><p>Try another search or health filter.</p></div>}
+      {!initiatives.length && <div className="no-initiatives"><Search size={22} /><h3>No initiatives found</h3><p>Try another search or filter.</p></div>}
     </div>
     <div className="selection-dock"><div className="selection-stack">{selectedIds.slice(0, 5).map((id, index) => <span key={id} style={{ zIndex: 6 - index }}>{data.initiatives.find(item => item.id === id)?.name.slice(0, 1)}</span>)}{selectedIds.length > 5 && <span>+{selectedIds.length - 5}</span>}</div><div><strong>{selectedIds.length} initiatives selected</strong><p>Selection is shared with the tree view</p></div><button onClick={onViewTree}>View tree <ChevronRight size={14} /></button></div>
   </main>
